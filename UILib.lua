@@ -8,12 +8,19 @@
 		Size    = UDim2.fromOffset(540, 380),     -- starting size AND minimum size
 		MaxSize = UDim2.fromOffset(920, 640),     -- biggest it can be dragged to
 		HideKey = Enum.KeyCode.RightShift,        -- hides/shows the whole menu
+		OnClose = function() ... end,             -- runs when the user confirms the X button (your cleanup)
 	})
 
 	Window:SetHideKey(key) / Window:GetHideKey()
 	Window:SetHidden(bool) / Window:ToggleHidden()
 	Window:SetMinimized(bool) / Window:ToggleMinimized()   -- the top-right shrink button
+	Window:RequestClose()   -- what the X button does: hides the UI and asks "are you sure?"
+	Window:Close()          -- runs OnClose, then destroys everything (no prompt)
 	Window:Destroy()
+
+	The title bar also has a search box: type to filter every toggle / slider /
+	dropdown / button / label by name (dropdowns also match their option names).
+	Tabs with no matches are dimmed, and the window jumps to the first tab that has one.
 
 	local Tab = Window:AddTab("Name")
 	Tab:AddToggle({Name, Default, Keybind, Callback})             -> :Set(bool) :Get() :SetKey(key|nil) :GetKey()
@@ -65,6 +72,8 @@ local Theme = {
 	Text = Color3.fromRGB(235, 235, 242),
 	SubText = Color3.fromRGB(150, 150, 168),
 	Stroke = Color3.fromRGB(52, 52, 66),
+	Danger = Color3.fromRGB(200, 60, 70),
+	DangerHover = Color3.fromRGB(225, 80, 90),
 }
 
 local FONT = Enum.Font.Gotham
@@ -229,9 +238,14 @@ function UILib:CreateWindow(opts)
 	self.Minimized = false
 	self.Hidden = false
 	self.HideKey = opts.HideKey or opts.MinimizeKey or Enum.KeyCode.RightShift
+	self._title = opts.Title or "UI Library"
+	self._onClose = opts.OnClose
 	self._conns = {}
 	self._capturing = false
 	self._hideListening = false
+	self._confirming = false
+	self._destroyed = false
+	self._query = ""
 	self._dirty = true
 	self._token = 0
 
@@ -279,10 +293,10 @@ function UILib:CreateWindow(opts)
 		Parent = main,
 	})
 	label({
-		Text = opts.Title or "UI Library",
+		Text = self._title,
 		Font = FONT_BOLD,
 		Position = UDim2.fromOffset(14, 0),
-		Size = UDim2.new(1, -200, 1, 0),
+		Size = UDim2.new(1, -350, 1, 0),
 		TextTruncate = Enum.TextTruncate.AtEnd,
 		Parent = topbar,
 	})
@@ -294,15 +308,93 @@ function UILib:CreateWindow(opts)
 		Parent = topbar,
 	})
 
+	-- Right-hand cluster (laid out automatically): search, hide chip, shrink, close
+	local right = new("Frame", {
+		Name = "Right",
+		Position = UDim2.fromOffset(8, 0),
+		Size = UDim2.new(1, -16, 1, 0),
+		BackgroundTransparency = 1,
+		Parent = topbar,
+	}, {
+		new("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			HorizontalAlignment = Enum.HorizontalAlignment.Right,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Padding = UDim.new(0, 6),
+		}),
+	})
+
+	-- search box
+	local search = new("TextBox", {
+		Name = "Search",
+		LayoutOrder = 1,
+		Size = UDim2.fromOffset(130, 22),
+		BackgroundColor3 = Theme.Element,
+		Text = "",
+		PlaceholderText = "Search...",
+		PlaceholderColor3 = Theme.SubText,
+		TextColor3 = Theme.Text,
+		TextSize = 13,
+		Font = FONT,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ClearTextOnFocus = false,
+		ClipsDescendants = true,
+		Parent = right,
+	}, { corner(6), padding(8, 0, 8, 0) })
+	local searchStroke = stroke(Theme.Stroke)
+	searchStroke.Parent = search
+	self._search = search
+	search.Focused:Connect(function()
+		tween(searchStroke, { Color = Theme.Accent }, 0.15)
+	end)
+	search.FocusLost:Connect(function()
+		tween(searchStroke, { Color = Theme.Stroke }, 0.15)
+	end)
+	search:GetPropertyChangedSignal("Text"):Connect(function()
+		self:_applySearch(search.Text)
+	end)
+
+	-- hide-key chip, click to rebind
+	local chip = new("TextButton", {
+		LayoutOrder = 2,
+		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.fromOffset(0, 22),
+		BackgroundColor3 = Theme.Element,
+		Text = "",
+		TextSize = 12,
+		Font = FONT,
+		TextColor3 = Theme.SubText,
+		AutoButtonColor = false,
+		Parent = right,
+	}, { corner(6), padding(8, 0, 8, 0) })
+	hover(chip, chip, Theme.Element, Theme.ElementHover)
+	self._chip = chip
+	self:_refreshChip()
+
+	chip.MouseButton1Click:Connect(function()
+		if self._hideListening then
+			self._hideListening = false
+			self:_refreshChip()
+			self:_endCapture()
+		else
+			self._hideListening = true
+			self:_refreshChip()
+			self:_beginCapture(function()
+				self._hideListening = false
+				self:_refreshChip()
+			end)
+		end
+	end)
+
 	-- shrink button (icon is drawn, so it never depends on font glyphs)
 	local minBtn = new("TextButton", {
+		LayoutOrder = 3,
 		Size = UDim2.fromOffset(28, 24),
-		AnchorPoint = Vector2.new(1, 0.5),
-		Position = UDim2.new(1, -8, 0.5, 0),
 		BackgroundColor3 = Theme.Element,
 		Text = "",
 		AutoButtonColor = false,
-		Parent = topbar,
+		Parent = right,
 	}, { corner(6) })
 	hover(minBtn, minBtn, Theme.Element, Theme.ElementHover)
 	new("Frame", {
@@ -325,37 +417,29 @@ function UILib:CreateWindow(opts)
 		self:ToggleMinimized()
 	end)
 
-	-- hide-key chip, sits next to the shrink button; click to rebind
-	local chip = new("TextButton", {
-		AutomaticSize = Enum.AutomaticSize.X,
-		Size = UDim2.fromOffset(0, 22),
-		AnchorPoint = Vector2.new(1, 0.5),
-		Position = UDim2.new(1, -44, 0.5, 0),
+	-- close button (drawn X): hides the UI and asks for confirmation
+	local closeBtn = new("TextButton", {
+		LayoutOrder = 4,
+		Size = UDim2.fromOffset(28, 24),
 		BackgroundColor3 = Theme.Element,
 		Text = "",
-		TextSize = 12,
-		Font = FONT,
-		TextColor3 = Theme.SubText,
 		AutoButtonColor = false,
-		Parent = topbar,
-	}, { corner(6), padding(8, 0, 8, 0) })
-	hover(chip, chip, Theme.Element, Theme.ElementHover)
-	self._chip = chip
-	self:_refreshChip()
-
-	chip.MouseButton1Click:Connect(function()
-		if self._hideListening then
-			self._hideListening = false
-			self:_refreshChip()
-			self:_endCapture()
-		else
-			self._hideListening = true
-			self:_refreshChip()
-			self:_beginCapture(function()
-				self._hideListening = false
-				self:_refreshChip()
-			end)
-		end
+		Parent = right,
+	}, { corner(6) })
+	hover(closeBtn, closeBtn, Theme.Element, Theme.Danger)
+	for _, rot in ipairs({ 45, -45 }) do
+		new("Frame", {
+			Size = UDim2.fromOffset(13, 2),
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Rotation = rot,
+			BackgroundColor3 = Theme.Text,
+			BorderSizePixel = 0,
+			Parent = closeBtn,
+		}, { corner(1) })
+	end
+	closeBtn.MouseButton1Click:Connect(function()
+		self:RequestClose()
 	end)
 
 	-- Body ----------------------------------------------------------
@@ -376,22 +460,25 @@ function UILib:CreateWindow(opts)
 		Parent = body,
 	}, { corner(8), padding(6, 6, 6, 6) })
 
-	self._indicator = new("Frame", {
-		Size = UDim2.fromOffset(3, TAB_H - 12),
-		Position = UDim2.fromOffset(-5, 6),
-		BackgroundColor3 = Theme.Accent,
-		BorderSizePixel = 0,
-		ZIndex = 3,
-		Visible = false,
-		Parent = self._sidebar,
-	}, { corner(2) })
-
 	self._pages = new("Frame", {
 		Position = UDim2.fromOffset(132, 8),
 		Size = UDim2.new(1, -140, 1, -(8 + BOTTOM_MARGIN)),
 		BackgroundTransparency = 1,
 		ClipsDescendants = true,
 		Parent = body,
+	})
+
+	self._noResults = label({
+		Name = "NoResults",
+		Text = "No results",
+		TextColor3 = Theme.SubText,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Size = UDim2.new(1, 0, 0, 40),
+		Position = UDim2.fromOffset(0, 24),
+		Visible = false,
+		ZIndex = 2,
+		Parent = self._pages,
 	})
 
 	-- Resize grip (bottom-right) -------------------------------------
@@ -498,7 +585,7 @@ function UILib:CreateWindow(opts)
 			self:_endCapture()
 			return
 		end
-		if gameProcessed or self._capturing then
+		if gameProcessed or self._capturing or self._confirming then
 			return
 		end
 		if input.KeyCode == self.HideKey then
@@ -600,7 +687,7 @@ function Window:SetHidden(state)
 		tween(self._rootStroke, { Transparency = 1 }, 0.22, Enum.EasingStyle.Quad)
 		tween(root, { Position = self._home + UDim2.fromOffset(0, 16) }, 0.25)
 		task.delay(0.28, function()
-			if self.Hidden and self._token == token then
+			if self.Hidden and self._token == token and not self._destroyed then
 				self._gui.Enabled = false
 				root.Position = self._home
 			end
@@ -648,12 +735,170 @@ function Window:ToggleMinimized()
 	self:SetMinimized(not self.Minimized)
 end
 
+---------------------------------------------------------------------
+-- Close: X button -> UI slides away -> small "are you sure?" window
+---------------------------------------------------------------------
+function Window:RequestClose()
+	if self._confirming or self._destroyed then
+		return
+	end
+	self._confirming = true
+	self:SetHidden(true)
+
+	local gui = new("ScreenGui", {
+		Name = "UILibConfirm",
+		ResetOnSpawn = false,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		DisplayOrder = 200,
+		IgnoreGuiInset = true,
+		Parent = self._gui.Parent,
+	})
+	self._confirmGui = gui
+
+	local outline = stroke(Theme.Stroke)
+	outline.Transparency = 1
+	local dialog = new("Frame", {
+		Size = UDim2.fromOffset(320, 138),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 14),
+		BackgroundTransparency = 1,
+		Parent = gui,
+	}, { corner(10), outline })
+	local box = new("CanvasGroup", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Theme.Background,
+		BorderSizePixel = 0,
+		GroupTransparency = 1,
+		Parent = dialog,
+	}, { corner(10) })
+
+	label({
+		Text = "Close " .. self._title .. "?",
+		Font = FONT_BOLD,
+		TextSize = 17,
+		Position = UDim2.fromOffset(16, 14),
+		Size = UDim2.new(1, -32, 0, 24),
+		Parent = box,
+	})
+	label({
+		Text = "This stops the script and removes the UI completely.",
+		TextColor3 = Theme.SubText,
+		TextSize = 13,
+		TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		Position = UDim2.fromOffset(16, 42),
+		Size = UDim2.new(1, -32, 0, 36),
+		Parent = box,
+	})
+
+	local function makeButton(text, color, overColor, position)
+		local b = new("TextButton", {
+			Text = text,
+			Font = FONT_BOLD,
+			TextSize = 14,
+			TextColor3 = Color3.new(1, 1, 1),
+			BackgroundColor3 = color,
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Position = position,
+			Size = UDim2.new(0.5, -21, 0, 34),
+			Parent = box,
+		}, { corner(6) })
+		hover(b, b, color, overColor)
+		return b
+	end
+	local closeBtn = makeButton("Close", Theme.Danger, Theme.DangerHover, UDim2.new(0, 16, 1, -50))
+	local backBtn = makeButton("Go Back", Theme.Element, Theme.ElementHover, UDim2.new(0.5, 5, 1, -50))
+
+	tween(box, { GroupTransparency = 0 }, 0.25, Enum.EasingStyle.Quad)
+	tween(outline, { Transparency = 0 }, 0.25, Enum.EasingStyle.Quad)
+	tween(dialog, { Position = UDim2.fromScale(0.5, 0.5) }, 0.3)
+
+	closeBtn.MouseButton1Click:Connect(function()
+		self:Close()
+	end)
+	backBtn.MouseButton1Click:Connect(function()
+		self._confirming = false
+		self._confirmGui = nil
+		tween(box, { GroupTransparency = 1 }, 0.2, Enum.EasingStyle.Quad)
+		tween(outline, { Transparency = 1 }, 0.2, Enum.EasingStyle.Quad)
+		tween(dialog, { Position = UDim2.new(0.5, 0, 0.5, 14) }, 0.2)
+		task.delay(0.25, function()
+			if gui.Parent then
+				gui:Destroy()
+			end
+		end)
+		self:SetHidden(false)
+	end)
+end
+
+-- Runs your OnClose cleanup, then destroys the window (no prompt).
+function Window:Close()
+	if self._destroyed then
+		return
+	end
+	local fn = self._onClose
+	self._onClose = nil
+	if fn then
+		local ok, err = pcall(fn)
+		if not ok then
+			warn("UILib OnClose error: " .. tostring(err))
+		end
+	end
+	self:Destroy()
+end
+
 function Window:Destroy()
+	if self._destroyed then
+		return
+	end
+	self._destroyed = true
 	for _, c in ipairs(self._conns) do
 		c:Disconnect()
 	end
 	table.clear(self._conns)
+	if self._confirmGui then
+		self._confirmGui:Destroy()
+		self._confirmGui = nil
+	end
 	self._gui:Destroy()
+end
+
+---------------------------------------------------------------------
+-- Search: dims non-matching items (they collapse away) across all tabs
+---------------------------------------------------------------------
+function Window:_applySearch(text)
+	local q = string.lower(text or ""):match("^%s*(.-)%s*$")
+	self._query = q
+	local searching = q ~= ""
+
+	local total, firstTab, activeHas = 0, nil, false
+	for _, tab in ipairs(self.Tabs) do
+		local count = 0
+		for _, item in ipairs(tab._items) do
+			local match = not searching or string.find(item.Search or "", q, 1, true) ~= nil
+			tween(item.Filter, { Value = match and 1 or 0 }, 0.25)
+			if match then
+				count += 1
+			end
+		end
+		total += count
+		if count > 0 and not firstTab then
+			firstTab = tab
+		end
+		if tab == self._active and count > 0 then
+			activeHas = true
+		end
+		tween(tab.Button, { TextTransparency = (searching and count == 0) and 0.65 or 0 }, 0.2)
+	end
+
+	self._noResults.Text = searching and ('No results for "' .. q .. '"') or "No results"
+	self._noResults.Visible = searching and total == 0
+
+	if searching and not activeHas and firstTab then
+		self:SelectTab(firstTab)
+	end
+	self._dirty = true
 end
 
 function Window:SelectTab(tab)
@@ -679,11 +924,6 @@ function Window:SelectTab(tab)
 	tab.Page.Visible = true
 	tween(tab.Page, { Position = UDim2.fromOffset(0, 0) }, 0.3)
 	self._dirty = true
-
-	self._indicator.Visible = true
-	tween(self._indicator, {
-		Position = UDim2.fromOffset(-5, (tab.Index - 1) * (TAB_H + TAB_GAP) + 6),
-	}, 0.3)
 end
 
 function Window:AddTab(name)
@@ -753,7 +993,7 @@ end
 -- live target rect (which keeps updating), so it stays smooth even if you
 -- keep dragging or a dropdown is opening mid-transition.
 ---------------------------------------------------------------------
-function Tab:_element(height, showWhen)
+function Tab:_element(height, showWhen, name)
 	local frame = new("Frame", {
 		Size = UDim2.fromOffset(200, height),
 		BackgroundColor3 = Theme.Element,
@@ -766,8 +1006,15 @@ function Tab:_element(height, showWhen)
 		Frame = frame,
 		Base = height, -- nominal height, used for stable column assignment
 		Height = new("NumberValue", { Value = height, Parent = frame }), -- tweenable live height
+		Search = string.lower(name or ""), -- text the search box matches against
 	}
 	item.Height.Changed:Connect(function()
+		self.Window._dirty = true
+	end)
+
+	-- Filter (0..1) is driven by the search box: 0 collapses the item away.
+	item.Filter = new("NumberValue", { Value = 1, Parent = frame })
+	item.Filter.Changed:Connect(function()
 		self.Window._dirty = true
 	end)
 
@@ -857,7 +1104,7 @@ function Tab:_layout(dt)
 	local targets = {}
 	for i, item in ipairs(items) do
 		local c = assign[i]
-		local r = item.Reveal.Value
+		local r = item.Reveal.Value * item.Filter.Value -- gate x search
 		local h = item.Height.Value * r
 		targets[i] = { x = PAD_L + (c - 1) * (colW + COL_GAP), y = y[c], w = colW, h = h, r = r }
 		y[c] += h + ITEM_GAP * r
@@ -912,7 +1159,7 @@ end
 -- Label
 ---------------------------------------------------------------------
 function Tab:AddLabel(text, opts)
-	local frame = self:_element(28, opts and opts.ShowWhen)
+	local frame, item = self:_element(28, opts and opts.ShowWhen, text)
 	local lbl = label({
 		Text = text or "",
 		TextColor3 = Theme.SubText,
@@ -925,6 +1172,7 @@ function Tab:AddLabel(text, opts)
 	local obj = { Frame = frame }
 	function obj:Set(t)
 		lbl.Text = t
+		item.Search = string.lower(t or "")
 	end
 	return obj
 end
@@ -934,7 +1182,7 @@ end
 ---------------------------------------------------------------------
 function Tab:AddButton(opts)
 	opts = opts or {}
-	local frame = self:_element(36, opts.ShowWhen)
+	local frame = self:_element(36, opts.ShowWhen, opts.Name)
 	local btn = new("TextButton", {
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
@@ -962,7 +1210,7 @@ function Tab:AddToggle(opts)
 	local state = opts.Default == true
 	local key = opts.Keybind
 
-	local frame, item = self:_element(38, opts.ShowWhen)
+	local frame, item = self:_element(38, opts.ShowWhen, opts.Name)
 	local hit = new("TextButton", {
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
@@ -1123,7 +1371,7 @@ function Tab:AddSlider(opts)
 		return tonumber(string.format("%." .. dec .. "f", v))
 	end
 
-	local frame = self:_element(56, opts.ShowWhen)
+	local frame = self:_element(56, opts.ShowWhen, opts.Name)
 	label({
 		Text = opts.Name or "Slider",
 		Position = UDim2.fromOffset(12, 6),
@@ -1256,7 +1504,7 @@ local function buildDropdown(tab, opts, multi)
 	local buttons = {}
 	local listH = 0
 
-	local frame, item = tab:_element(HEADER_H, opts.ShowWhen)
+	local frame, item = tab:_element(HEADER_H, opts.ShowWhen, opts.Name)
 	frame.ClipsDescendants = true
 	item.KeepClip = true -- the open/close animation always needs clipping
 
@@ -1419,6 +1667,12 @@ local function buildDropdown(tab, opts, multi)
 			setOpen(true)
 		end
 		render()
+
+		-- the search box matches the dropdown's name and its option names
+		item.Search = string.lower((opts.Name or "") .. " " .. table.concat(options, " "))
+		if tab.Window._query ~= "" then
+			tab.Window:_applySearch(tab.Window._query)
+		end
 	end
 
 	-- defaults
@@ -1426,7 +1680,7 @@ local function buildDropdown(tab, opts, multi)
 		for _, n in ipairs(opts.Default or {}) do
 			selected[tostring(n)] = true
 		end
-	elseif opts.Default ~= nil then
+	elseif opts.Default ~= nil and opts.Default ~= "" then
 		single = tostring(opts.Default)
 	end
 	build()
