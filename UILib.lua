@@ -23,6 +23,15 @@
 	Tab:AddButton({Name, Callback})
 	Tab:AddLabel(text)                                            -> :Set(text)
 
+	Toggle-gated items: pass ShowWhen = <toggle object> to ANY Add* call and that
+	item only shows (and can only be used) while the toggle is on. It slides
+	open/closed and stays in the same column as its toggle:
+
+		local boost = Tab:AddToggle({Name = "Speed Boost"})
+		Tab:AddSlider({Name = "Boost Speed", Min = 16, Max = 100, ShowWhen = boost})
+
+	Toggles also have :OnChanged(function(isOn) ... end) for your own logic.
+
 	Rebinding: click the "Hide: <key>" chip in the title bar, or the key box on a
 	toggle, then press a key. (Backspace clears a toggle's key / cancels the chip.)
 	Resizing: drag the grip in the bottom-right corner. When the window is wide
@@ -744,7 +753,7 @@ end
 -- live target rect (which keeps updating), so it stays smooth even if you
 -- keep dragging or a dropdown is opening mid-transition.
 ---------------------------------------------------------------------
-function Tab:_element(height)
+function Tab:_element(height, showWhen)
 	local frame = new("Frame", {
 		Size = UDim2.fromOffset(200, height),
 		BackgroundColor3 = Theme.Element,
@@ -761,6 +770,24 @@ function Tab:_element(height)
 	item.Height.Changed:Connect(function()
 		self.Window._dirty = true
 	end)
+
+	-- Reveal (0..1) scales the item's height and gap. Items created with
+	-- ShowWhen = <toggle> animate it as the toggle flips, so they slide
+	-- open/closed and stay in their toggle's column.
+	local shown = true
+	if showWhen then
+		shown = showWhen:Get()
+		item.Follow = showWhen._item
+	end
+	item.Reveal = new("NumberValue", { Value = shown and 1 or 0, Parent = frame })
+	item.Reveal.Changed:Connect(function()
+		self.Window._dirty = true
+	end)
+	if showWhen then
+		showWhen:OnChanged(function(on)
+			tween(item.Reveal, { Value = on and 1 or 0 }, 0.35)
+		end)
+	end
 	table.insert(self._items, item)
 	self.Window._dirty = true
 	return frame, item
@@ -809,13 +836,18 @@ function Tab:_layout(dt)
 	end
 
 	-- stable column assignment from nominal heights (balanced, reading order)
-	local assign, baseH = {}, { 0, 0 }
+	local assign, baseH, colOf = {}, { 0, 0 }, {}
 	for i, item in ipairs(items) do
 		local c = 1
-		if cols == 2 and baseH[2] < baseH[1] then
-			c = 2
+		if cols == 2 then
+			if item.Follow and colOf[item.Follow] then
+				c = colOf[item.Follow] -- gated items stay under their toggle
+			elseif baseH[2] < baseH[1] then
+				c = 2
+			end
 		end
 		assign[i] = c
+		colOf[item] = c
 		baseH[c] += item.Base + ITEM_GAP
 	end
 
@@ -825,9 +857,10 @@ function Tab:_layout(dt)
 	local targets = {}
 	for i, item in ipairs(items) do
 		local c = assign[i]
-		local h = item.Height.Value
-		targets[i] = { x = PAD_L + (c - 1) * (colW + COL_GAP), y = y[c], w = colW, h = h }
-		y[c] += h + ITEM_GAP
+		local r = item.Reveal.Value
+		local h = item.Height.Value * r
+		targets[i] = { x = PAD_L + (c - 1) * (colW + COL_GAP), y = y[c], w = colW, h = h, r = r }
+		y[c] += h + ITEM_GAP * r
 	end
 	local canvasH = math.max(y[1], y[2]) - ITEM_GAP + PAD_B
 
@@ -851,8 +884,13 @@ function Tab:_layout(dt)
 		local fr = item.Frame
 		fr.Position = UDim2.fromOffset(math.floor(x + 0.5), math.floor(yy + 0.5))
 		fr.Size = UDim2.fromOffset(math.floor(w + 0.5), math.floor(h + 0.5))
-		if not fr.Visible then
-			fr.Visible = true
+		local visible = t.r > 0.001 -- fully collapsed items are hidden, so they can't be clicked
+		if fr.Visible ~= visible then
+			fr.Visible = visible
+		end
+		local clip = item.KeepClip or t.r < 0.999 -- clip only while sliding, so glows aren't cut off
+		if fr.ClipsDescendants ~= clip then
+			fr.ClipsDescendants = clip
 		end
 	end
 
@@ -873,8 +911,8 @@ end
 ---------------------------------------------------------------------
 -- Label
 ---------------------------------------------------------------------
-function Tab:AddLabel(text)
-	local frame = self:_element(28)
+function Tab:AddLabel(text, opts)
+	local frame = self:_element(28, opts and opts.ShowWhen)
 	local lbl = label({
 		Text = text or "",
 		TextColor3 = Theme.SubText,
@@ -896,7 +934,7 @@ end
 ---------------------------------------------------------------------
 function Tab:AddButton(opts)
 	opts = opts or {}
-	local frame = self:_element(36)
+	local frame = self:_element(36, opts.ShowWhen)
 	local btn = new("TextButton", {
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
@@ -924,7 +962,7 @@ function Tab:AddToggle(opts)
 	local state = opts.Default == true
 	local key = opts.Keybind
 
-	local frame = self:_element(38)
+	local frame, item = self:_element(38, opts.ShowWhen)
 	local hit = new("TextButton", {
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
@@ -973,7 +1011,11 @@ function Tab:AddToggle(opts)
 		Parent = frame,
 	}, { corner(5), padding(8, 0, 8, 0) })
 
-	local obj = { Frame = frame }
+	local subs = {}
+	local obj = { Frame = frame, _item = item }
+	function obj:OnChanged(fn)
+		table.insert(subs, fn)
+	end
 
 	local function render(animate)
 		local d = animate and 0.2 or 0
@@ -992,6 +1034,9 @@ function Tab:AddToggle(opts)
 		end
 		state = v
 		render(true)
+		for _, fn in ipairs(subs) do
+			task.spawn(fn, state)
+		end
 		if not silent then
 			fire(opts.Callback, state)
 		end
@@ -1078,7 +1123,7 @@ function Tab:AddSlider(opts)
 		return tonumber(string.format("%." .. dec .. "f", v))
 	end
 
-	local frame = self:_element(56)
+	local frame = self:_element(56, opts.ShowWhen)
 	label({
 		Text = opts.Name or "Slider",
 		Position = UDim2.fromOffset(12, 6),
@@ -1211,8 +1256,9 @@ local function buildDropdown(tab, opts, multi)
 	local buttons = {}
 	local listH = 0
 
-	local frame, item = tab:_element(HEADER_H)
+	local frame, item = tab:_element(HEADER_H, opts.ShowWhen)
 	frame.ClipsDescendants = true
+	item.KeepClip = true -- the open/close animation always needs clipping
 
 	local header = new("TextButton", {
 		Size = UDim2.new(1, 0, 0, HEADER_H),
