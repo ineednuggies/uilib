@@ -23,12 +23,13 @@
 	Tabs with no matches are dimmed, and the window jumps to the first tab that has one.
 
 	local Tab = Window:AddTab("Name")
-	Tab:AddToggle({Name, Default, Keybind, Callback})             -> :Set(bool) :Get() :SetKey(key|nil) :GetKey()
-	Tab:AddSlider({Name, Min, Max, Default, Increment, Callback}) -> :Set(n) :Get()
-	Tab:AddDropdown({Name, Options, Default, Callback})           -> :Set(str) :Get() :SetOptions(list)
-	Tab:AddMultiDropdown({Name, Options, Default = {}, Callback}) -> :Set(list) :Get() :SetOptions(list)
+	Tab:AddToggle({Name, Default, Keybind, Flag, Callback})       -> :Set(bool) :Get() :SetKey(key|nil) :GetKey()
+	Tab:AddSlider({Name, Min, Max, Default, Increment, Flag, Callback}) -> :Set(n) :Get()
+	Tab:AddDropdown({Name, Options, Default, Flag, Callback})      -> :Set(str) :Get() :SetOptions(list)
+	Tab:AddMultiDropdown({Name, Options, Default = {}, Flag, Callback}) -> :Set(list) :Get() :SetOptions(list)
+	Tab:AddTextbox({Name, Default, Placeholder, Flag, Callback})   -> :Set(str) :Get()
 	Tab:AddButton({Name, Callback})
-	Tab:AddLabel(text)                                            -> :Set(text)
+	Tab:AddLabel(text)                                             -> :Set(text)
 
 	Toggle-gated items: pass ShowWhen = <toggle object> to ANY Add* call and that
 	item only shows (and can only be used) while the toggle is on. It slides
@@ -43,12 +44,35 @@
 	toggle, then press a key. (Backspace clears a toggle's key / cancels the chip.)
 	Resizing: drag the grip in the bottom-right corner. When the window is wide
 	enough, each tab's items smoothly re-flow into two columns.
+
+	-------------------------------------------------------------------------
+	Config system: give any AddToggle/AddSlider/AddDropdown/AddMultiDropdown/
+	AddTextbox a Flag = "UniqueName" and its value is tracked automatically.
+
+	Window:GetConfig()               -> {Flag = value, ...} snapshot of everything
+	Window:ApplyConfig(tbl)          -> pushes a {Flag = value, ...} table into the UI
+	Window:SaveConfig(name)          -> writes it to disk as JSON, returns the JSON string
+	Window:LoadConfig(name)          -> reads + applies a config saved by name -> true/false
+	Window:ListConfigs()             -> names of configs saved to disk
+	Window:DeleteConfig(name)        -> removes a saved config -> true/false
+	Window:DownloadConfig(name)      -> SaveConfig + copies the JSON to the clipboard
+	Window:UploadConfig(text, name?) -> loads a saved config by name, OR applies a
+	                                     pasted JSON string (optionally saving it too)
+
+	Saving/loading to disk and the clipboard need an executor that exposes
+	writefile/readfile/listfiles/delfile/setclipboard. Without one (e.g. plain
+	Roblox Studio), GetConfig/ApplyConfig and the JSON string still work for the
+	current session - only persistence across sessions needs those functions.
+
+	Window:AddConfigTab("Configs") builds a ready-made tab with Save / Load /
+	Delete / Copy / Import controls wired to the methods above.
 ]]
 
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
 
 local UILib = {}
 
@@ -174,6 +198,14 @@ local function fire(callback, ...)
 	end
 end
 
+-- Any widget with a Flag = "name" gets tracked here so the config system
+-- can snapshot/restore it generically through its shared :Get()/:Set() shape.
+local function registerFlag(tab, opts, obj)
+	if opts and opts.Flag then
+		tab.Window.Flags[opts.Flag] = obj
+	end
+end
+
 local function decimalsOf(increment)
 	local frac = tostring(increment):match("%.(%d+)")
 	return frac and #frac or 0
@@ -235,11 +267,13 @@ function UILib:CreateWindow(opts)
 	opts = opts or {}
 	local self = setmetatable({}, Window)
 	self.Tabs = {}
+	self.Flags = {}
 	self.Minimized = false
 	self.Hidden = false
 	self.HideKey = opts.HideKey or opts.MinimizeKey or Enum.KeyCode.RightShift
 	self._title = opts.Title or "UI Library"
 	self._onClose = opts.OnClose
+	self._configFolder = opts.ConfigFolder
 	self._conns = {}
 	self._capturing = false
 	self._hideListening = false
@@ -1349,6 +1383,7 @@ function Tab:AddToggle(opts)
 		end
 	end)
 
+	registerFlag(self, opts, obj)
 	return obj
 end
 
@@ -1485,6 +1520,59 @@ function Tab:AddSlider(opts)
 		end
 	end)
 
+	registerFlag(self, opts, obj)
+	return obj
+end
+
+---------------------------------------------------------------------
+-- Textbox (single-line text input, e.g. for config names or pasted JSON)
+---------------------------------------------------------------------
+function Tab:AddTextbox(opts)
+	opts = opts or {}
+	local frame = self:_element(38, opts.ShowWhen, opts.Name)
+	label({
+		Text = opts.Name or "Textbox",
+		Position = UDim2.fromOffset(12, 0),
+		Size = UDim2.new(0.4, -4, 1, 0),
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = frame,
+	})
+	local box = new("TextBox", {
+		Size = UDim2.new(0.6, -20, 0, 24),
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -10, 0.5, 0),
+		BackgroundColor3 = Theme.Background,
+		Text = opts.Default or "",
+		PlaceholderText = opts.Placeholder or "",
+		PlaceholderColor3 = Theme.SubText,
+		TextColor3 = Theme.Text,
+		TextSize = 13,
+		Font = FONT,
+		ClearTextOnFocus = false,
+		ClipsDescendants = true,
+		Parent = frame,
+	}, { corner(5), padding(8, 0, 8, 0), stroke(Theme.Stroke) })
+
+	local value = box.Text
+	local obj = { Frame = frame }
+	function obj:Set(v, silent)
+		v = tostring(v or "")
+		box.Text = v
+		value = v
+		if not silent then
+			fire(opts.Callback, v)
+		end
+	end
+	function obj:Get()
+		return value
+	end
+
+	box.FocusLost:Connect(function(enterPressed)
+		value = box.Text
+		fire(opts.Callback, value, enterPressed)
+	end)
+
+	registerFlag(self, opts, obj)
 	return obj
 end
 
@@ -1731,6 +1819,7 @@ local function buildDropdown(tab, opts, multi)
 		setOpen(v and true or false)
 	end
 
+	registerFlag(tab, opts, obj)
 	return obj
 end
 
@@ -1740,6 +1829,240 @@ end
 
 function Tab:AddMultiDropdown(opts)
 	return buildDropdown(self, opts, true)
+end
+
+---------------------------------------------------------------------
+-- Config system: save/load flagged widget values as named JSON configs.
+--
+-- Give any AddToggle/AddSlider/AddDropdown/AddMultiDropdown/AddTextbox a
+-- Flag = "UniqueName" and its value is tracked in Window.Flags. Configs are
+-- plain JSON, so GetConfig/ApplyConfig work in Roblox Studio too - only
+-- writing to disk ("save"/"download") and reading it back later ("load"/
+-- "upload") need a script executor that exposes
+-- writefile/readfile/isfile/makefolder/isfolder/listfiles/delfile/setclipboard.
+-- Without those, SaveConfig/DownloadConfig still return the JSON string so
+-- it can be copied by hand, and UploadConfig still accepts pasted JSON.
+---------------------------------------------------------------------
+local function sanitize(name)
+	return (tostring(name or ""):gsub("[^%w%-%_ ]", ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+function Window:SetConfigFolder(folder)
+	self._configFolder = folder
+end
+
+function Window:_folder()
+	return self._configFolder or ("UILibConfigs/" .. sanitize(self._title))
+end
+
+function Window:_ensureFolder()
+	pcall(function()
+		if makefolder and not (isfolder and isfolder(self:_folder())) then
+			makefolder(self:_folder())
+		end
+	end)
+end
+
+function Window:_path(name)
+	return self:_folder() .. "/" .. sanitize(name) .. ".json"
+end
+
+-- Snapshot every flagged widget's current value into a {Flag = value} table.
+function Window:GetConfig()
+	local data = {}
+	for flag, obj in pairs(self.Flags) do
+		local ok, v = pcall(function()
+			return obj:Get()
+		end)
+		if ok then
+			data[flag] = v
+		end
+	end
+	return data
+end
+
+-- Push a {Flag = value} table (from GetConfig, LoadConfig, or hand-written)
+-- back into the matching widgets. Unknown flags are ignored.
+function Window:ApplyConfig(data)
+	for flag, value in pairs(data or {}) do
+		local obj = self.Flags[flag]
+		if obj then
+			pcall(function()
+				obj:Set(value, true)
+			end)
+		end
+	end
+end
+
+-- Encode the current config to JSON and write it to disk under `name`
+-- if the executor supports it. Always returns the JSON string.
+function Window:SaveConfig(name)
+	local json = HttpService:JSONEncode(self:GetConfig())
+	if writefile then
+		self:_ensureFolder()
+		pcall(writefile, self:_path(name), json)
+	end
+	return json
+end
+
+-- Read a config saved under `name` back from disk and apply it.
+function Window:LoadConfig(name)
+	if not (readfile and isfile and isfile(self:_path(name))) then
+		return false
+	end
+	local ok, json = pcall(readfile, self:_path(name))
+	if not ok then
+		return false
+	end
+	local decodeOk, data = pcall(function()
+		return HttpService:JSONDecode(json)
+	end)
+	if not decodeOk then
+		return false
+	end
+	self:ApplyConfig(data)
+	return true
+end
+
+-- Names of every config saved to disk for this window (empty without an executor).
+function Window:ListConfigs()
+	local names = {}
+	if listfiles and isfolder and isfolder(self:_folder()) then
+		for _, path in ipairs(listfiles(self:_folder())) do
+			local name = path:match("([^/\\]+)%.json$")
+			if name then
+				table.insert(names, name)
+			end
+		end
+	end
+	table.sort(names)
+	return names
+end
+
+function Window:DeleteConfig(name)
+	if delfile and isfile and isfile(self:_path(name)) then
+		pcall(delfile, self:_path(name))
+		return true
+	end
+	return false
+end
+
+-- "Download": same as SaveConfig, plus copies the JSON to the clipboard when
+-- possible so it can be pasted/saved by hand if there's no filesystem access.
+function Window:DownloadConfig(name)
+	local json = self:SaveConfig(name)
+	if setclipboard then
+		pcall(setclipboard, json)
+	end
+	return json
+end
+
+-- "Upload": pass either the name of a config already saved to disk, or a
+-- raw JSON string (e.g. pasted from a textbox) starting with "{". Optionally
+-- pass saveAsName to also save a pasted config to disk under that name.
+function Window:UploadConfig(input, saveAsName)
+	input = tostring(input or "")
+	if input:match("^%s*{") then
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(input)
+		end)
+		if not ok then
+			return false
+		end
+		self:ApplyConfig(data)
+		if saveAsName then
+			self:SaveConfig(saveAsName)
+		end
+		return true
+	end
+	return self:LoadConfig(input)
+end
+
+-- Ready-made "Configs" tab: create/save/load/delete named configs, plus
+-- copy-to-clipboard and paste-to-import for sharing a config as raw JSON.
+function Window:AddConfigTab(name)
+	local tab = self:AddTab(name or "Configs")
+
+	tab:AddLabel("Save, load, or share your current settings.")
+
+	local list = tab:AddDropdown({
+		Name = "Saved Configs",
+		Options = self:ListConfigs(),
+	})
+
+	local status = tab:AddLabel("")
+
+	local function refreshList()
+		list:SetOptions(self:ListConfigs())
+	end
+
+	local nameBox = tab:AddTextbox({
+		Name = "Config Name",
+		Placeholder = "e.g. default",
+	})
+
+	tab:AddButton({
+		Name = "Save Config",
+		Callback = function()
+			local n = nameBox:Get()
+			if n == "" then
+				status:Set("Enter a name to save.")
+				return
+			end
+			self:SaveConfig(n)
+			refreshList()
+			status:Set('Saved "' .. n .. '".')
+		end,
+	})
+
+	tab:AddButton({
+		Name = "Load Selected",
+		Callback = function()
+			local n = list:Get()
+			if not n then
+				status:Set("Select a config first.")
+				return
+			end
+			status:Set(self:LoadConfig(n) and ('Loaded "' .. n .. '".') or "Couldn't load that config.")
+		end,
+	})
+
+	tab:AddButton({
+		Name = "Delete Selected",
+		Callback = function()
+			local n = list:Get()
+			if not n then
+				status:Set("Select a config first.")
+				return
+			end
+			self:DeleteConfig(n)
+			refreshList()
+			status:Set('Deleted "' .. n .. '".')
+		end,
+	})
+
+	tab:AddButton({
+		Name = "Copy Current Config",
+		Callback = function()
+			local target = list:Get() or (nameBox:Get() ~= "" and nameBox:Get()) or "config"
+			local json = self:DownloadConfig(target)
+			status:Set(setclipboard and "Copied to clipboard." or json)
+		end,
+	})
+
+	local importBox = tab:AddTextbox({
+		Name = "Paste Config JSON",
+		Placeholder = '{"Flag": value, ...}',
+	})
+
+	tab:AddButton({
+		Name = "Import",
+		Callback = function()
+			status:Set(self:UploadConfig(importBox:Get()) and "Imported." or "Couldn't parse that.")
+		end,
+	})
+
+	return tab
 end
 
 return UILib
